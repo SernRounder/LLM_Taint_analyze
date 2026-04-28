@@ -8,7 +8,11 @@ Pipeline
 2. Run Ghidra headless BFS decompilation starting at *entry_address*.
 3. Store all decompiled function records in MongoDB.
 4. Call the selected LLM on each function to identify sources / sinks.
-5. Persist LLM results back to MongoDB.
+5. DFS taint-flow search: find every simple source→sink path in the
+   call-graph; store paths in a dedicated MongoDB database (one DB per
+   binary, collection named after the binary).
+6. Call the LLM once per discovered path to produce a flow-level summary
+   (severity, description, mitigation) and persist it.
 
 Scoped analysis (large-binary support)
 ---------------------------------------
@@ -45,11 +49,16 @@ Options
     --prompt-file        Path to a file whose contents are used as the custom prompt.
     --llm-batch-size     Process LLM calls N at a time, printing progress per
                          batch (default: 50).
+    --flow-prompt        Custom prompt prefix for LLM taint-flow analysis.
+    --flow-prompt-file   Path to a file whose contents are used as the flow prompt.
+    --flow-db-prefix     Prefix for the per-binary taint-flow database name
+                         (default: taint_flow).
     --mongo-uri          MongoDB connection URI.
     --db-name            Analysis database name.
     --binary-db-name     Database name for the binary GridFS store.
     --skip-decompile     Skip the Ghidra step; assume decompiled data already in DB.
     --skip-llm           Skip the LLM step; only run decompilation.
+    --skip-flow          Skip the taint-flow DFS + LLM step.
     --binary-file        Path to a local binary file (skips MongoDB fetch).
 
 Environment variables (all optional)
@@ -130,6 +139,24 @@ def _build_parser() -> argparse.ArgumentParser:
                    help='Skip Ghidra; assume decompiled data is already in DB.')
     p.add_argument('--skip-llm', action='store_true',
                    help='Skip LLM analysis; only run decompilation.')
+    p.add_argument('--skip-flow', action='store_true',
+                   help='Skip the taint-flow DFS + LLM step.')
+    p.add_argument(
+        '--flow-prompt', default=None,
+        help='Custom prompt prefix for LLM taint-flow path analysis.',
+    )
+    p.add_argument(
+        '--flow-prompt-file', default=None,
+        help='File containing the custom LLM prompt for taint-flow analysis.',
+    )
+    p.add_argument(
+        '--flow-db-prefix', default=None,
+        help=(
+            'Prefix for the per-binary taint-flow MongoDB database name '
+            '(default: taint_flow).  The actual DB will be named '
+            '"<prefix>_<sanitised_uid>".'
+        ),
+    )
     p.add_argument('--binary-file', default=None,
                    help='Use a local binary file instead of fetching from MongoDB.')
     return p
@@ -147,6 +174,16 @@ def _load_prompt(args) -> str | None:
             sys.exit(1)
         return path.read_text()
     return args.prompt
+
+
+def _load_flow_prompt(args) -> str | None:
+    if args.flow_prompt_file:
+        path = Path(args.flow_prompt_file)
+        if not path.is_file():
+            print(f'[ERROR] Flow prompt file not found: {path}', file=sys.stderr)
+            sys.exit(1)
+        return path.read_text()
+    return args.flow_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +221,7 @@ def main() -> None:
     uid = args.uid
     entry_address = args.entry_address
     custom_prompt = _load_prompt(args)
+    flow_prompt = _load_flow_prompt(args)
 
     # ------------------------------------------------------------------
     # 1. Connect to analysis DB
@@ -244,6 +282,8 @@ def main() -> None:
     # ------------------------------------------------------------------
     if args.skip_llm:
         print('[analyze] Skipping LLM analysis (--skip-llm).')
+        if not args.skip_flow:
+            _run_flow_analysis(uid, db, None, flow_prompt, args)
         return
 
     print(f'[analyze] Loading LLM provider: {args.provider} …')
@@ -258,45 +298,50 @@ def main() -> None:
     functions = db.get_unanalyzed_functions(uid)
     if not functions:
         print('[analyze] All functions already have LLM results; nothing to do.')
-        return
+    else:
+        total_funcs = len(functions)
+        batch_size = args.llm_batch_size
+        print(
+            f'[analyze] Analyzing {total_funcs} function(s) with LLM '
+            f'(batch_size={batch_size}) …'
+        )
+        for i, func in enumerate(functions, 1):
+            addr = func['address']
+            name = func.get('function_name', addr)
+            code = func.get('decompiled_code', '')
 
-    total_funcs = len(functions)
-    batch_size = args.llm_batch_size
-    print(
-        f'[analyze] Analyzing {total_funcs} function(s) with LLM '
-        f'(batch_size={batch_size}) …'
-    )
-    for i, func in enumerate(functions, 1):
-        addr = func['address']
-        name = func.get('function_name', addr)
-        code = func.get('decompiled_code', '')
+            print(f'  [{i}/{total_funcs}] {name}  ({addr})', end=' ', flush=True)
 
-        print(f'  [{i}/{total_funcs}] {name}  ({addr})', end=' ', flush=True)
+            try:
+                raw_result = llm.analyze_function(code, custom_prompt)
+                is_source, is_sink = _parse_llm_response(raw_result)
+            except Exception as exc:  # noqa: BLE001
+                print(f'[WARN] LLM error: {exc}')
+                raw_result = ''
+                is_source, is_sink = False, False
 
-        try:
-            raw_result = llm.analyze_function(code, custom_prompt)
-            is_source, is_sink = _parse_llm_response(raw_result)
-        except Exception as exc:  # noqa: BLE001
-            print(f'[WARN] LLM error: {exc}')
-            raw_result = ''
-            is_source, is_sink = False, False
+            db.update_llm_result(uid, addr, raw_result, is_source, is_sink)
+            tags = []
+            if is_source:
+                tags.append('SOURCE')
+            if is_sink:
+                tags.append('SINK')
+            print(', '.join(tags) if tags else 'ok')
 
-        db.update_llm_result(uid, addr, raw_result, is_source, is_sink)
-        tags = []
-        if is_source:
-            tags.append('SOURCE')
-        if is_sink:
-            tags.append('SINK')
-        print(', '.join(tags) if tags else 'ok')
-
-        if batch_size > 0 and i % batch_size == 0 and i < total_funcs:
-            print(
-                f'[analyze] Progress: {i}/{total_funcs} functions analyzed '
-                f'({i * 100 // total_funcs}%) …'
-            )
+            if batch_size > 0 and i % batch_size == 0 and i < total_funcs:
+                print(
+                    f'[analyze] Progress: {i}/{total_funcs} functions analyzed '
+                    f'({i * 100 // total_funcs}%) …'
+                )
 
     total = db.count_functions(uid)
     print(f'[analyze] Done.  {total} function(s) stored for UID {uid!r}.')
+
+    # ------------------------------------------------------------------
+    # 4. Taint-flow DFS + per-path LLM analysis
+    # ------------------------------------------------------------------
+    if not args.skip_flow:
+        _run_flow_analysis(uid, db, llm, flow_prompt, args)
 
 
 def _run_decompilation(uid, entry_address, max_depth, max_functions, no_analysis, binary_path, db):
@@ -322,6 +367,69 @@ def _run_decompilation(uid, entry_address, max_depth, max_functions, no_analysis
 
     db.upsert_functions(records)
     print(f'[analyze] Stored {len(records)} decompiled function(s) in MongoDB.')
+
+
+def _run_flow_analysis(uid, db, llm, flow_prompt, args):
+    """Stage 4: DFS taint-flow search + per-path LLM analysis."""
+    from src.taint_flow import find_taint_paths  # noqa: PLC0415
+    from src.flow_db import FlowDB              # noqa: PLC0415
+
+    print('[analyze] Running taint-flow DFS …')
+    all_funcs = db.get_all_functions(uid)
+    paths = find_taint_paths(all_funcs)
+
+    if not paths:
+        print('[analyze] No source→sink paths found.')
+        return
+
+    print(f'[analyze] Found {len(paths)} taint path(s). Storing to flow database …')
+    flow_db = FlowDB(
+        uid=uid,
+        mongo_uri=args.mongo_uri,
+        flow_db_prefix=args.flow_db_prefix,
+    )
+
+    # Attach uid and default flow_llm_result before inserting
+    for p in paths:
+        p['uid'] = uid
+        p.setdefault('flow_llm_result', None)
+
+    inserted = flow_db.insert_paths(paths)
+    print(f'[analyze] Stored {inserted} new path record(s).')
+
+    if llm is None:
+        print('[analyze] No LLM available for flow analysis (--skip-llm was set).')
+        return
+
+    pending = flow_db.get_unanalyzed_paths()
+    if not pending:
+        print('[analyze] All paths already have flow LLM results.')
+        return
+
+    print(f'[analyze] Analyzing {len(pending)} path(s) with LLM …')
+    for i, path_rec in enumerate(pending, 1):
+        src = path_rec['source_address']
+        snk = path_rec['sink_address']
+        flow = path_rec['taint_flow']
+        funcs = path_rec.get('functions', [])
+        sink_code = path_rec.get('sink_decompiled', '')
+
+        print(
+            f'  [{i}/{len(pending)}] {src} → {snk}  '
+            f'({len(flow)} hop(s))',
+            end=' ', flush=True,
+        )
+
+        try:
+            raw = llm.analyze_flow(flow, funcs, sink_code, flow_prompt)
+        except Exception as exc:  # noqa: BLE001
+            print(f'[WARN] LLM flow error: {exc}')
+            raw = ''
+
+        flow_db.update_flow_llm_result(src, snk, flow, raw)
+        print('ok')
+
+    print(f'[analyze] Taint-flow analysis complete. Total paths: {flow_db.count_paths()}')
 
 
 if __name__ == '__main__':
