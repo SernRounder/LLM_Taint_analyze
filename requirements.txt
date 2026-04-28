@@ -1,0 +1,5 @@
+pymongo>=4.6
+# LLM providers (install only the ones you need)
+openai>=1.14          # required for: gpt, lmstudio
+google-generativeai>=0.5  # required for: gemini
+# ollama uses only stdlib (urllib)
