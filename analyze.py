@@ -4,15 +4,29 @@ analyze.py – Main CLI for the LLM taint-analysis pipeline.
 
 Pipeline
 --------
-1. Fetch the firmware binary from MongoDB (via fetch_binary).
+1. Fetch the firmware binary from MongoDB (via fetch_binary) **or** read it
+   directly from a local file with ``--binary-file`` (no MongoDB required).
 2. Run Ghidra headless BFS decompilation starting at *entry_address*.
-3. Store all decompiled function records in MongoDB.
+3. Store all decompiled function records (MongoDB or in-memory).
 4. Call the selected LLM on each function to identify sources / sinks.
 5. DFS taint-flow search: find every simple source→sink path in the
-   call-graph; store paths in a dedicated MongoDB database (one DB per
-   binary, collection named after the binary).
+   call-graph; store paths in a dedicated database (one DB per binary,
+   collection named after the binary).
 6. Call the LLM once per discovered path to produce a flow-level summary
    (severity, description, mitigation) and persist it.
+
+MongoDB-free local mode
+-----------------------
+When ``--binary-file`` is provided **and** ``--mongo-uri`` is not given,
+the pipeline automatically switches to an in-memory backend – no MongoDB
+installation is required.  Use ``--output-json`` to save the analysis
+results to a JSON file instead.
+
+Example (fully local, no MongoDB)::
+
+    python analyze.py my_binary 0x00401000 \\
+        --binary-file /path/to/firmware.elf \\
+        --output-json results.json
 
 Scoped analysis (large-binary support)
 ---------------------------------------
@@ -33,7 +47,9 @@ Usage
     python analyze.py <uid> <entry_address> [options]
 
 Positional arguments
-    uid              FACT UID of the binary stored in MongoDB.
+    uid              Label / identifier for this binary.  When using
+                     ``--binary-file`` without MongoDB, this can be any
+                     short name (e.g. the filename stem).
     entry_address    Hex address of the entry function for BFS
                      (e.g. 0x00401000).
 
@@ -53,13 +69,18 @@ Options
     --flow-prompt-file   Path to a file whose contents are used as the flow prompt.
     --flow-db-prefix     Prefix for the per-binary taint-flow database name
                          (default: taint_flow).
-    --mongo-uri          MongoDB connection URI.
+    --mongo-uri          MongoDB connection URI.  When omitted together with
+                         ``--binary-file``, local in-memory storage is used.
     --db-name            Analysis database name.
     --binary-db-name     Database name for the binary GridFS store.
     --skip-decompile     Skip the Ghidra step; assume decompiled data already in DB.
     --skip-llm           Skip the LLM step; only run decompilation.
     --skip-flow          Skip the taint-flow DFS + LLM step.
     --binary-file        Path to a local binary file (skips MongoDB fetch).
+                         When combined with no ``--mongo-uri``, the entire
+                         pipeline runs without MongoDB.
+    --output-json        Path to write analysis results as JSON (functions +
+                         taint-flow paths).  Useful in local mode.
 
 Environment variables (all optional)
     EXTERNAL_LLM_PRIMARY_MONGO_URI
@@ -90,7 +111,14 @@ def _build_parser() -> argparse.ArgumentParser:
         description='LLM-assisted taint analysis via Ghidra BFS decompilation.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument('uid', help='FACT UID of the target binary in MongoDB.')
+    p.add_argument(
+        'uid',
+        help=(
+            'Label / identifier for this binary.  When MongoDB is used this '
+            'must be the FACT UID.  In local mode (--binary-file without '
+            '--mongo-uri) any short name such as the filename stem is fine.'
+        ),
+    )
     p.add_argument(
         'entry_address',
         help='Hex entry address for BFS decompilation (e.g. 0x00401000).',
@@ -158,7 +186,19 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument('--binary-file', default=None,
-                   help='Use a local binary file instead of fetching from MongoDB.')
+                   help=(
+                       'Path to a local binary file.  Skips MongoDB GridFS fetch.  '
+                       'When --mongo-uri is also omitted, the entire pipeline runs '
+                       'without MongoDB (in-memory local mode).'
+                   ))
+    p.add_argument(
+        '--output-json', default=None, metavar='PATH',
+        help=(
+            'Write analysis results (functions + taint-flow paths) to this '
+            'JSON file.  Especially useful in local mode when no MongoDB is '
+            'available to persist results.'
+        ),
+    )
     return p
 
 
@@ -225,11 +265,21 @@ def main() -> None:
 
     # ------------------------------------------------------------------
     # 1. Connect to analysis DB
+    #
+    # Local mode: when --binary-file is given and no --mongo-uri is
+    # specified, use the in-memory LocalAnalysisDB so that MongoDB is not
+    # required at all.
     # ------------------------------------------------------------------
-    from src.db import AnalysisDB  # noqa: PLC0415
+    local_mode = bool(args.binary_file and not args.mongo_uri)
 
-    print('[analyze] Connecting to analysis database …')
-    db = AnalysisDB(mongo_uri=args.mongo_uri, db_name=args.db_name)
+    if local_mode:
+        from src.local_db import LocalAnalysisDB  # noqa: PLC0415
+        print('[analyze] Local mode: using in-memory analysis database (no MongoDB).')
+        db = LocalAnalysisDB(output_json=args.output_json)
+    else:
+        from src.db import AnalysisDB  # noqa: PLC0415
+        print('[analyze] Connecting to analysis database …')
+        db = AnalysisDB(mongo_uri=args.mongo_uri, db_name=args.db_name)
 
     # ------------------------------------------------------------------
     # 2. Ghidra BFS decompilation
@@ -283,7 +333,9 @@ def main() -> None:
     if args.skip_llm:
         print('[analyze] Skipping LLM analysis (--skip-llm).')
         if not args.skip_flow:
-            _run_flow_analysis(uid, db, None, flow_prompt, args)
+            _run_flow_analysis(uid, db, None, flow_prompt, args, local_mode=local_mode)
+        if local_mode:
+            db.save_json()
         return
 
     print(f'[analyze] Loading LLM provider: {args.provider} …')
@@ -341,7 +393,15 @@ def main() -> None:
     # 4. Taint-flow DFS + per-path LLM analysis
     # ------------------------------------------------------------------
     if not args.skip_flow:
-        _run_flow_analysis(uid, db, llm, flow_prompt, args)
+        _run_flow_analysis(uid, db, llm, flow_prompt, args, local_mode=local_mode)
+
+    # ------------------------------------------------------------------
+    # 5. Persist function results to JSON (local mode)
+    # ------------------------------------------------------------------
+    if local_mode:
+        db.save_json()
+        if args.output_json:
+            print(f'[analyze] Results written to {args.output_json}')
 
 
 def _run_decompilation(uid, entry_address, max_depth, max_functions, no_analysis, binary_path, db):
@@ -366,13 +426,12 @@ def _run_decompilation(uid, entry_address, max_depth, max_functions, no_analysis
         rec.setdefault('is_sink', False)
 
     db.upsert_functions(records)
-    print(f'[analyze] Stored {len(records)} decompiled function(s) in MongoDB.')
+    print(f'[analyze] Stored {len(records)} decompiled function record(s).')
 
 
-def _run_flow_analysis(uid, db, llm, flow_prompt, args):
+def _run_flow_analysis(uid, db, llm, flow_prompt, args, *, local_mode: bool = False):
     """Stage 4: DFS taint-flow search + per-path LLM analysis."""
     from src.taint_flow import find_taint_paths  # noqa: PLC0415
-    from src.flow_db import FlowDB              # noqa: PLC0415
 
     print('[analyze] Running taint-flow DFS …')
     all_funcs = db.get_all_functions(uid)
@@ -383,11 +442,24 @@ def _run_flow_analysis(uid, db, llm, flow_prompt, args):
         return
 
     print(f'[analyze] Found {len(paths)} taint path(s). Storing to flow database …')
-    flow_db = FlowDB(
-        uid=uid,
-        mongo_uri=args.mongo_uri,
-        flow_db_prefix=args.flow_db_prefix,
-    )
+
+    if local_mode:
+        from src.local_db import LocalFlowDB  # noqa: PLC0415
+        output_json = getattr(args, 'output_json', None)
+        # Derive a sibling path for flow results when output_json is set
+        flow_output = None
+        if output_json:
+            from pathlib import Path as _Path  # noqa: PLC0415
+            p = _Path(output_json)
+            flow_output = p.parent / (p.stem + '_flows' + p.suffix)
+        flow_db = LocalFlowDB(uid=uid, output_json=flow_output)
+    else:
+        from src.flow_db import FlowDB  # noqa: PLC0415
+        flow_db = FlowDB(
+            uid=uid,
+            mongo_uri=args.mongo_uri,
+            flow_db_prefix=args.flow_db_prefix,
+        )
 
     # Attach uid and default flow_llm_result before inserting
     for p in paths:
@@ -399,11 +471,15 @@ def _run_flow_analysis(uid, db, llm, flow_prompt, args):
 
     if llm is None:
         print('[analyze] No LLM available for flow analysis (--skip-llm was set).')
+        if local_mode:
+            flow_db.save_json()
         return
 
     pending = flow_db.get_unanalyzed_paths()
     if not pending:
         print('[analyze] All paths already have flow LLM results.')
+        if local_mode:
+            flow_db.save_json()
         return
 
     print(f'[analyze] Analyzing {len(pending)} path(s) with LLM …')
@@ -430,6 +506,9 @@ def _run_flow_analysis(uid, db, llm, flow_prompt, args):
         print('ok')
 
     print(f'[analyze] Taint-flow analysis complete. Total paths: {flow_db.count_paths()}')
+
+    if local_mode:
+        flow_db.save_json()
 
 
 if __name__ == '__main__':
