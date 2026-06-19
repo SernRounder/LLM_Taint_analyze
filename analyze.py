@@ -336,6 +336,8 @@ def main() -> None:
             _run_flow_analysis(uid, db, None, flow_prompt, args, local_mode=local_mode)
         if local_mode:
             db.save_json()
+            if args.output_json:
+                print(f'[analyze] Results written to {args.output_json}')
         return
 
     print(f'[analyze] Loading LLM provider: {args.provider} …')
@@ -449,8 +451,7 @@ def _run_flow_analysis(uid, db, llm, flow_prompt, args, *, local_mode: bool = Fa
         # Derive a sibling path for flow results when output_json is set
         flow_output = None
         if output_json:
-            from pathlib import Path as _Path  # noqa: PLC0415
-            p = _Path(output_json)
+            p = Path(output_json)
             flow_output = p.parent / (p.stem + '_flows' + p.suffix)
         flow_db = LocalFlowDB(uid=uid, output_json=flow_output)
     else:

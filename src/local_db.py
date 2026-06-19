@@ -85,7 +85,8 @@ class LocalAnalysisDB:
     # ------------------------------------------------------------------
 
     def get_function(self, uid: str, address: str) -> dict[str, Any] | None:
-        return dict(self._store.get((uid, address), {})) or None
+        record = self._store.get((uid, address))
+        return dict(record) if record is not None else None
 
     def get_all_functions(self, uid: str) -> list[dict[str, Any]]:
         return [dict(v) for (u, _), v in self._store.items() if u == uid]
